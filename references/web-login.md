@@ -551,7 +551,10 @@ async def form_csrf(request: Request) -> str:
     body = await request.body()
     if len(body) > 2048:
         return ""
-    values = parse_qs(body.decode("ascii", "ignore"), max_num_fields=4).get("csrf", [])
+    try:
+        values = parse_qs(body.decode("ascii", "ignore"), max_num_fields=4).get("csrf", [])
+    except ValueError:  # more fields than allowed: treat as a form without a token
+        return ""
     return values[0] if len(values) == 1 else ""
 
 
@@ -1704,7 +1707,7 @@ def test_bot_without_web_login_behaves_as_before(sent: list[tuple[str, dict[str,
 - [ ] Allowlist проверяется на каждом запросе и при выдаче: отзыв действует сразу, в том числе на веб-сессии.
 - [ ] В бот приходит «Запрос с: <браузер>, <IP>», чтобы заметить чужую ссылку входа.
 - [ ] В логах нет id, токенов, кодов, ключа (тест это проверяет).
-- [ ] Предпросмотр ссылки в Telegram отключён (`link_preview_options`), страница ссылки отдаёт `Referrer-Policy: no-referrer`.
+- [ ] Предпросмотр ссылки в Telegram отключён (`link_preview_options`), страница подтверждения ссылки отдаёт `Referrer-Policy: same-origin` (с `no-referrer` форма подтверждения получает отказ 403).
 
 ## 11. Типичные ошибки
 
