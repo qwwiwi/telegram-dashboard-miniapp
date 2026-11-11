@@ -19,6 +19,7 @@
 - **Привязка к браузеру** – куки, которая выдаётся при старте попытки и подтверждает: код вводит тот же браузер, что начал вход.
 - **Одноразовая ссылка (magic link)** – адрес с длинным случайным токеном. Работает один раз и недолго.
 - **Сессия** – запись в базе после входа. Браузер хранит её токен в куки, база – только его хеш.
+- **Токен подтверждения (csrf)** – скрытое поле кнопки «Войти» на странице одноразовой ссылки. Оно считается от куки этого браузера и от самой ссылки ключом сервера, поэтому чужая страница не может отправить такую кнопку от имени вашего браузера.
 
 ## 2. Как это работает
 
@@ -32,12 +33,18 @@
 4. Backend сверяет id с allowlist, сохраняет хеши ссылки и кода и возвращает ссылку, код и
    «откуда запрос» (браузер и IP). Бот отправляет всё это владельцу в личный чат.
 5a. Владелец нажимает ссылку: страница просит нажать «Войти» (так предпросмотр ссылки в
-    Telegram не тратит токен), POST /auth/magic/<токен> один раз -> сессия, куки dash_session.
+    Telegram не тратит токен). Страница ставит этому браузеру куки dash_csrf и кладёт в форму
+    скрытое поле csrf. POST /auth/magic/<токен> проходит, только если (1) Origin (или Referer)
+    наш и (2) поле csrf совпадает с куки и ссылкой. Тогда ссылка тратится один раз -> сессия,
+    куки dash_session.
 5b. Или вводит код на странице: POST /auth/code. Работает только в браузере с куки-привязкой,
     недолго; 5 неверных кодов сжигают попытку.
 6. Сессия: случайный токен в куки (HttpOnly, Secure, SameSite=Lax), в базе только sha256,
    срок жизни, выход (POST /auth/logout), «выйти везде» (команда бота /logout_all).
+   Куки принимается, только пока расширение включено.
 ```
+
+Зачем две проверки на подтверждении. Без них чужая страница могла бы отправить форму с **чужой** (злоумышленника) действующей ссылкой из браузера жертвы: жертва оказалась бы вошедшей под чужим Telegram-id и дальше вносила бы свои данные в чужой аккаунт («login CSRF»). `SameSite=Lax` этого не останавливает: он запрещает отправлять куки, но не запрещает браузеру принять новую. Поэтому: (1) любой POST под `/auth/...` принимается только со своей страницы (заголовок Origin, а если его нет, Referer; нет обоих, `null` или чужой адрес – 403); (2) подтверждение ссылки требует токен подтверждения.
 
 Команда `/login` в боте даёт только ссылку, без кода: код действует лишь в браузере, который начал попытку.
 
@@ -48,13 +55,13 @@
 | Файл | Что |
 |---|---|
 | `app/weblogin.py` | **новый**: вся логика (попытки, коды, сессии) и адреса `/auth/...`, `/login`, `/internal/...` |
-| `app/settings.py` | правка: пять новых настроек |
+| `app/settings.py` | правка: шесть новых настроек (в том числе ключ сервера `web_hmac_key`) |
 | `app/main.py` | правка: четыре места (импорт, `current_user`, создание таблиц, подключение адресов) |
 | `static/login.html` | **новый**: страница входа |
 | `static/index.html` | правка: в обычном браузере брать цифры по куки и отправлять на `/login`; кнопка «Выйти» |
 | `bot/bot.py` | правка: команды `/start login_...`, `/login`, `/logout_all` |
 | `tests/test_web_login.py` | **новый**: тесты |
-| `deploy/Caddyfile`, файлы настроек | правка: закрыть `/internal` снаружи, новые переменные |
+| `deploy/Caddyfile`, файлы настроек | правка: закрыть `/internal` снаружи, новые переменные (в том числе `WEB_LOGIN_HMAC_KEY`) |
 
 Расширение включается настройками: пока их нет, адреса не подключаются, и каркас работает как раньше.
 
@@ -63,11 +70,14 @@
 В `.env.example` (и в файлах настроек на сервере) добавьте:
 
 ```bash
-# Web login (references/web-login.md). Backend needs all three; the bot needs the last two.
+# Web login (references/web-login.md). Backend needs the first four; the bot needs the last two.
 PUBLIC_URL=https://dashboard.example.com
 WEB_LOGIN_BOT_USERNAME=<your_bot>
 # Shared secret between the bot and the backend: python -c "import secrets; print(secrets.token_urlsafe(32))"
-WEB_LOGIN_INTERNAL_KEY=<<random string, 32+ characters>>
+WEB_LOGIN_INTERNAL_KEY=<<random string, 32+ bytes>>
+# Backend ONLY (not in bot.env, not in the database): key of the code hashes and of the confirm-form tokens.
+# A different value from the one above: python -c "import secrets; print(secrets.token_urlsafe(32))"
+WEB_LOGIN_HMAC_KEY=<<another random string, 32+ bytes>>
 # Bot only: where the backend listens (loopback)
 WEB_LOGIN_INTERNAL_URL=http://127.0.0.1:8000
 ```
@@ -76,10 +86,12 @@ WEB_LOGIN_INTERNAL_URL=http://127.0.0.1:8000
 
 | Файл настроек | Новые переменные |
 |---|---|
-| `backend.env` | `PUBLIC_URL`, `WEB_LOGIN_BOT_USERNAME` (без `@`), `WEB_LOGIN_INTERNAL_KEY` |
+| `backend.env` | `PUBLIC_URL`, `WEB_LOGIN_BOT_USERNAME` (без `@`), `WEB_LOGIN_INTERNAL_KEY`, `WEB_LOGIN_HMAC_KEY` |
 | `bot.env` | `WEB_LOGIN_INTERNAL_URL`, `WEB_LOGIN_INTERNAL_KEY` (то же значение, что у backend) |
 
-`PUBLIC_URL` backend нужен, чтобы собрать адрес одноразовой ссылки. Ключ – секрет: только в файлы настроек, не в чат, не в git, не в логи.
+`PUBLIC_URL` backend нужен, чтобы собрать адрес одноразовой ссылки и чтобы знать, какой Origin считать «своим». Оба ключа – секреты: только в файлы настроек, не в чат, не в git, не в логи.
+
+Ключ `WEB_LOGIN_HMAC_KEY` нужен потому, что кодов всего миллион: хеш без ключа перебирается за секунды, и копия базы раскрыла бы код. С ключом, которого в базе нет, одной копии базы недостаточно. Ключ длиной меньше 32 байт или пустой при включённом расширении: приложение **не запускается** (в ошибке названа переменная, значения нет). Смена ключа безопасна: текущие попытки входа перестанут подходить (их срок 5 минут), сессии остаются.
 
 ## 5. Таблицы
 
@@ -96,7 +108,7 @@ WEB_LOGIN_INTERNAL_URL=http://127.0.0.1:8000
 
 Схема лежит в `app/weblogin.py` (список `SCHEMA`), создаётся при старте приложения, повтор безопасен (`IF NOT EXISTS`). Что хранится:
 
-- `login_attempts`: хеш метки, хеш привязки к браузеру, хеш ссылки, хеш кода (от строки «хеш метки:код»), кому выдано, срок, счётчик неверных кодов, отметка «использовано». Ни метки, ни токена, ни кода в открытом виде.
+- `login_attempts`: хеш метки, хеш привязки к браузеру, хеш ссылки, HMAC кода (ключ сервера `WEB_LOGIN_HMAC_KEY` над строкой «хеш метки:код»; ключа в базе нет), кому выдано, срок, счётчик неверных кодов, отметка «использовано». Ни метки, ни токена, ни кода в открытом виде. Токены подтверждения в базе не хранятся вообще.
 - `web_sessions`: хеш токена, кому принадлежит, срок, отметка отзыва.
 
 Если в проекте уже переведено на Postgres по `postgres.md`, отдельных правок не нужно: код пишет через те же `conn.execute(...)` с `?`.
@@ -119,7 +131,10 @@ WEB_LOGIN_INTERNAL_URL=http://127.0.0.1:8000
     # Web login (references/web-login.md). It is switched on only when the first three are set.
     web_bot_username: str = ""  # the bot's @username without «@»
     public_url: str = ""  # https://dashboard.example.com, no trailing slash
-    internal_key: str = ""  # shared secret between the bot and the backend (min 32 characters)
+    internal_key: str = ""  # shared secret between the bot and the backend (min 32 bytes)
+    # Server key of the code hashes and of the confirm-form tokens. Lives only in backend.env, never in the database,
+    # never in the bot's file. When web login is on and it is missing or shorter than 32 bytes, the app does not start.
+    web_hmac_key: str = ""
     login_ttl_s: int = 300  # life of a login attempt, of a one-time link and of a code
     web_session_ttl_s: int = 7 * 86400
 
@@ -142,6 +157,7 @@ WEB_LOGIN_INTERNAL_URL=http://127.0.0.1:8000
         web_bot_username=env.get("WEB_LOGIN_BOT_USERNAME", "").strip().lstrip("@"),
         public_url=env.get("PUBLIC_URL", "").strip().rstrip("/"),
         internal_key=env.get("WEB_LOGIN_INTERNAL_KEY", "").strip(),
+        web_hmac_key=env.get("WEB_LOGIN_HMAC_KEY", "").strip(),
     )
 ```
 
@@ -150,7 +166,10 @@ WEB_LOGIN_INTERNAL_URL=http://127.0.0.1:8000
 Один новый модуль. Почему адреса собираются функцией `build_router(...)`, а не лежат в `main.py`: модулю нужны `get_conn`, `get_settings` и `now_ts` из `main.py`, а `main.py` импортирует модуль. Передача их аргументами убирает круговой импорт и не дублирует код.
 
 Что здесь важно для безопасности (каждое свойство проверяет тест из раздела 8):
-- токены – 256 случайных бит, в базе только sha256; код хранится как хеш от «хеш метки:код»;
+- токены – 256 случайных бит, в базе только sha256; код хранится как HMAC-SHA256 от «хеш метки:код» с ключом сервера, которого нет в базе;
+- любой POST под `/auth/...` принимается только с нашего Origin (если Origin нет, с нашего Referer), иначе 403 и ничего не меняется;
+- подтверждение ссылки требует токен подтверждения, привязанный к браузеру (куки `dash_csrf`) и к ссылке;
+- куки сессии принимается только при включённом расширении; присутствующий заголовок `Authorization` либо верный `Bearer`, либо 401;
 - сравнение хешей – постоянного времени (`hmac.compare_digest`);
 - ссылка и код одноразовые: «использовано» ставится одним условным `UPDATE`, поэтому две одновременные попытки не пройдут обе;
 - 5 неверных кодов сжигают попытку (в том же `UPDATE`, без гонки);
@@ -170,12 +189,16 @@ WEB_LOGIN_INTERNAL_URL=http://127.0.0.1:8000
 3. The user taps the link (GET shows a confirm page, POST consumes it: link previews never log in) or types the
    code (POST /auth/code, only in the bound browser). 5 wrong codes burn the attempt.
 4. A session is a random token in a cookie; the database keeps its sha256.
-Tokens are 256-bit and stored only as sha256. The code is stored as sha256("<nonce hash>:<code>").
+Tokens are 256-bit and stored only as sha256. The code is stored as HMAC-SHA256("<nonce hash>:<code>") under a server
+key that is not in the database: a database dump alone does not give the 6 digits.
+Every POST under /auth must come from our own page (Origin, else Referer), and the confirm form carries a token bound
+to the browser's cookie and to the link: a foreign page cannot log a victim's browser in under the attacker's id.
 No id, token or code is ever logged.
 """
 
 from __future__ import annotations
 
+import hashlib
 import hmac
 import logging
 import re
@@ -184,6 +207,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
+from urllib.parse import parse_qs, urlsplit
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, Response
@@ -196,6 +220,7 @@ logger = logging.getLogger("dashboard")
 STATIC = Path(__file__).resolve().parent.parent / "static"  # the same folder as in app.main
 SESSION_COOKIE = "dash_session"
 LOGIN_COOKIE = "dash_login"  # ties an attempt to the browser that started it; only sent to /auth/...
+CSRF_COOKIE = "dash_csrf"  # the browser half of the confirm-form token; only sent to /auth/magic/...
 TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]{43}$")  # token_urlsafe(32)
 MAX_CODE_FAILS = 5
 LOOPBACK = frozenset({"127.0.0.1", "::1"})
@@ -258,9 +283,44 @@ def new_code() -> str:
     return f"{secrets.randbelow(1_000_000):06d}"
 
 
-def code_hash(nonce_hash: str, code: str) -> str:
-    """The code is stored tied to its attempt: the same 6 digits give different hashes in different attempts."""
-    return auth.sha256_hex(f"{nonce_hash}:{code}")
+def code_hash(key: str, nonce_hash: str, code: str) -> str:
+    """HMAC-SHA256 of «nonce hash:code» under the server key.
+
+    Tied to the attempt (the same 6 digits give different hashes in different attempts) and keyed: only 10**6 codes
+    exist, so a plain hash would fall to a million tries for anyone holding a copy of the database.
+    """
+    return hmac.new(key.encode(), f"{nonce_hash}:{code}".encode(), hashlib.sha256).hexdigest()
+
+
+def csrf_field(key: str, cookie: str, token: str) -> str:
+    """The hidden field of the confirm form: HMAC of this browser's cookie and of this link. Only the server makes it."""
+    return hmac.new(key.encode(), f"csrf:{cookie}:{token}".encode(), hashlib.sha256).hexdigest()
+
+
+def csrf_ok(key: str, cookie: str | None, token: str, field: str) -> bool:
+    """True when ``field`` was made for this very cookie and this very link (constant-time comparison)."""
+    if not cookie or not TOKEN_RE.fullmatch(cookie) or not field.isascii():
+        return False
+    return hmac.compare_digest(csrf_field(key, cookie, token).encode(), field.encode())
+
+
+def origin_of(url: str) -> str:
+    """«scheme://host[:port]» in lower case; empty when the text has no host («null», garbage)."""
+    parts = urlsplit(url)
+    return f"{parts.scheme}://{parts.netloc}".lower() if parts.scheme and parts.netloc else ""
+
+
+def same_origin(origin: str | None, referer: str | None, public_url: str) -> bool:
+    """A POST may come only from our own page: Origin, and Referer when there is no Origin at all.
+
+    No Origin and no Referer, «null» and every foreign address are refused. A present Origin is never overridden by Referer.
+    """
+    expected = origin_of(public_url)
+    if not expected:
+        return False
+    if origin is not None:
+        return origin_of(origin) == expected
+    return bool(referer) and origin_of(referer or "") == expected
 
 
 _BROWSERS = (("YaBrowser/", "Яндекс Браузер"), ("Edg/", "Edge"), ("OPR/", "Opera"), ("Firefox/", "Firefox"),
@@ -320,7 +380,7 @@ def start_attempt(conn: Conn, ip: str, user_agent: str, now: float, ttl: int) ->
     return Started(nonce, binding)
 
 
-def issue(conn: Conn, tg_id: int, now: float, ttl: int, nonce: str | None) -> Issued:
+def issue(conn: Conn, tg_id: int, now: float, ttl: int, nonce: str | None, key: str) -> Issued:
     """Make a one-time link (and, for a browser attempt, a code) for an allowlisted id.
 
     ``nonce=None`` is the bot's /login: a link only, and a new one cancels the previous /login link.
@@ -352,7 +412,7 @@ def issue(conn: Conn, tg_id: int, now: float, ttl: int, nonce: str | None) -> Is
         changed = conn.execute(
             "UPDATE login_attempts SET issued_tg=?, code_hash=?, magic_hash=?, expires=? "
             "WHERE nonce_hash=? AND issued_tg IS NULL AND consumed_at IS NULL AND expires>?",
-            (tg_id, code_hash(nonce_hash, code), auth.sha256_hex(token), now + ttl, nonce_hash, now)).rowcount
+            (tg_id, code_hash(key, nonce_hash, code), auth.sha256_hex(token), now + ttl, nonce_hash, now)).rowcount
     if changed != 1:
         return Issued("used")
     return Issued("issued", token, code, row["ip"], row["browser"])
@@ -370,7 +430,7 @@ def consume_magic(conn: Conn, token: str, now: float) -> int | None:
     return int(rows[0][0]) if rows else None
 
 
-def verify_code(conn: Conn, binding: str | None, code: str, now: float) -> CodeResult:
+def verify_code(conn: Conn, binding: str | None, code: str, now: float, key: str) -> CodeResult:
     """Check a code against the attempt bound to THIS browser; there is no other kind of code."""
     row = None
     if binding and TOKEN_RE.fullmatch(binding):
@@ -386,7 +446,7 @@ def verify_code(conn: Conn, binding: str | None, code: str, now: float) -> CodeR
     if row["issued_tg"] is None:
         return CodeResult("not_issued")
     nonce_hash = row["nonce_hash"]
-    if hmac.compare_digest(code_hash(nonce_hash, code), row["code_hash"] or ""):
+    if hmac.compare_digest(code_hash(key, nonce_hash, code), row["code_hash"] or ""):
         with conn:
             changed = conn.execute("UPDATE login_attempts SET consumed_at=? WHERE nonce_hash=? AND consumed_at IS NULL",
                                    (now, nonce_hash)).rowcount
@@ -453,15 +513,18 @@ def _page(body: str) -> str:
             f'<title>Вход в дашборд</title>{_STYLE}</head><body><main>{body}</main></body></html>')
 
 
+CSRF_PAGE = _page("<h1>Страница устарела</h1><p>Откройте ссылку из Telegram ещё раз и нажмите «Войти» в том же браузере. "
+                  "Ссылка при этом не потрачена.</p>")
 INVALID_PAGE = _page("<h1>Ссылка недействительна</h1><p>Она устарела или уже использована. Откройте страницу входа "
                      "и нажмите «Перейти в Telegram» ещё раз или отправьте боту /login.</p>")
 LIMIT_PAGE = _page("<h1>Слишком много попыток</h1><p>Подождите 10 минут и попробуйте снова.</p>")
 
 
-def magic_page(token: str) -> str:
-    """The confirm page. The token is limited by TOKEN_RE to URL-safe characters, so it needs no escaping."""
+def magic_page(token: str, field: str) -> str:
+    """The confirm page. The token (TOKEN_RE) and the field (hex) are URL-safe characters, so they need no escaping."""
     return _page('<h1>Вход в дашборд</h1><p>Нажмите «Войти», чтобы открыть дашборд на этом устройстве.</p>'
-                 f'<form method="post" action="/auth/magic/{token}"><button type="submit">Войти</button></form>')
+                 f'<form method="post" action="/auth/magic/{token}"><input type="hidden" name="csrf" value="{field}">'
+                 '<button type="submit">Войти</button></form>')
 
 
 # ---------- HTTP ----------
@@ -483,6 +546,15 @@ def _client(request: Request) -> str:
     return request.client.host if request.client else "unknown"
 
 
+async def form_csrf(request: Request) -> str:
+    """The «csrf» field of the urlencoded confirm form ('' when absent). Parsed by hand: no extra package is needed."""
+    body = await request.body()
+    if len(body) > 2048:
+        return ""
+    values = parse_qs(body.decode("ascii", "ignore"), max_num_fields=4).get("csrf", [])
+    return values[0] if len(values) == 1 else ""
+
+
 def set_session_cookie(resp: Response, token: str, settings: Settings) -> None:
     """HttpOnly (no script can read it), Secure (HTTPS only), SameSite=Lax (not sent with cross-site POSTs)."""
     resp.set_cookie(SESSION_COOKIE, token, max_age=settings.web_session_ttl_s, httponly=True, secure=True,
@@ -496,6 +568,15 @@ def build_router(get_conn: Callable[..., Any], get_settings: Callable[..., Setti
     code_limit = auth.FailureLimiter(limit=10, window_s=600)  # failed codes only
     magic_limit = auth.FailureLimiter(limit=5, window_s=600)  # failed links only
     router = APIRouter()
+
+    def same_origin_guard(request: Request, settings: Settings = Depends(get_settings)) -> None:
+        """Every POST under /auth comes from our own page (Origin, else Referer); anything else is 403 and changes nothing."""
+        if request.method == "POST" and not same_origin(request.headers.get("origin"), request.headers.get("referer"),
+                                                        settings.public_url):
+            logger.warning("web login: POST from a foreign or unknown origin refused")
+            raise HTTPException(status_code=403)
+
+    auth_routes = APIRouter(prefix="/auth", dependencies=[Depends(same_origin_guard)])
     internal = APIRouter(prefix="/internal")
 
     def bot_guard(request: Request, settings: Settings = Depends(get_settings)) -> None:
@@ -511,7 +592,7 @@ def build_router(get_conn: Callable[..., Any], get_settings: Callable[..., Setti
     def login_page() -> FileResponse:
         return FileResponse(STATIC / "login.html", headers={"Cache-Control": "no-cache", "Referrer-Policy": "no-referrer"})
 
-    @router.post("/auth/start")
+    @auth_routes.post("/start")
     def auth_start(request: Request, conn: Conn = Depends(get_conn), s: Settings = Depends(get_settings),
                    t: float = Depends(now_ts)) -> JSONResponse:
         ip = _client(request)
@@ -526,13 +607,13 @@ def build_router(get_conn: Callable[..., Any], get_settings: Callable[..., Setti
                         samesite="lax", path="/auth")
         return resp
 
-    @router.post("/auth/code")
+    @auth_routes.post("/code")
     def auth_code(body: CodeIn, request: Request, conn: Conn = Depends(get_conn), s: Settings = Depends(get_settings),
                   t: float = Depends(now_ts)) -> JSONResponse:
         ip = _client(request)
         if code_limit.blocked(ip):
             raise HTTPException(status_code=429, detail=TOO_MANY)
-        res = verify_code(conn, request.cookies.get(LOGIN_COOKIE), body.code, t)
+        res = verify_code(conn, request.cookies.get(LOGIN_COOKIE), body.code, t, s.web_hmac_key)
         if res.status == "ok" and (res.tg_id is None or not auth.is_allowed(conn, res.tg_id)):
             res = CodeResult("none")  # the person was removed between the issue and the typing
         if res.status != "ok" or res.tg_id is None:
@@ -547,16 +628,31 @@ def build_router(get_conn: Callable[..., Any], get_settings: Callable[..., Setti
         resp.delete_cookie(LOGIN_COOKIE, path="/auth", secure=True, httponly=True)
         return resp
 
-    @router.get("/auth/magic/{token}", response_class=HTMLResponse)
-    def magic_confirm(token: str) -> HTMLResponse:
-        """GET only shows a button: a link preview or a prefetch never uses the token up."""
+    @auth_routes.get("/magic/{token}", response_class=HTMLResponse)
+    def magic_confirm(token: str, request: Request, s: Settings = Depends(get_settings)) -> HTMLResponse:
+        """GET only shows a button: a link preview or a prefetch never uses the token up.
+
+        It also hands this browser its half of the form token (an HttpOnly cookie). The other half, the hidden field, is
+        an HMAC of that cookie and of the link, so a page of another site can neither read nor guess it. Referrer-Policy
+        is same-origin, not no-referrer: with no-referrer a browser sends «Origin: null» with the form, and the Origin check
+        would refuse the owner too. Nothing is sent to other sites either way.
+        """
         if not TOKEN_RE.fullmatch(token):
             return HTMLResponse(INVALID_PAGE, status_code=400, headers=NO_STORE)
-        return HTMLResponse(magic_page(token), headers=NO_STORE)
+        mine = request.cookies.get(CSRF_COOKIE)
+        cookie = mine if mine and TOKEN_RE.fullmatch(mine) else new_token()  # two tabs keep working
+        resp = HTMLResponse(magic_page(token, csrf_field(s.web_hmac_key, cookie, token)),
+                            headers={**NO_STORE, "Referrer-Policy": "same-origin"})
+        resp.set_cookie(CSRF_COOKIE, cookie, max_age=s.login_ttl_s, httponly=True, secure=True, samesite="strict",
+                        path="/auth/magic")
+        return resp
 
-    @router.post("/auth/magic/{token}")
-    def magic_consume(token: str, request: Request, conn: Conn = Depends(get_conn), s: Settings = Depends(get_settings),
-                      t: float = Depends(now_ts)) -> Response:
+    @auth_routes.post("/magic/{token}")
+    def magic_consume(token: str, request: Request, field: str = Depends(form_csrf), conn: Conn = Depends(get_conn),
+                      s: Settings = Depends(get_settings), t: float = Depends(now_ts)) -> Response:
+        if not csrf_ok(s.web_hmac_key, request.cookies.get(CSRF_COOKIE), token, field):
+            # Not counted by the limiter (a foreign page must not be able to lock the owner out) and the link stays unspent.
+            return HTMLResponse(CSRF_PAGE, status_code=403, headers=NO_STORE)
         ip = _client(request)
         if magic_limit.blocked(ip):
             return HTMLResponse(LIMIT_PAGE, status_code=429, headers=NO_STORE)
@@ -568,9 +664,10 @@ def build_router(get_conn: Callable[..., Any], get_settings: Callable[..., Setti
             return HTMLResponse(INVALID_PAGE, status_code=400, headers=NO_STORE)
         resp = RedirectResponse("/", status_code=303, headers=NO_STORE)
         set_session_cookie(resp, create_session(conn, tg_id, t, s.web_session_ttl_s), s)
+        resp.delete_cookie(CSRF_COOKIE, path="/auth/magic", secure=True, httponly=True)
         return resp
 
-    @router.post("/auth/logout")
+    @auth_routes.post("/logout")
     def logout(request: Request, conn: Conn = Depends(get_conn), t: float = Depends(now_ts)) -> JSONResponse:
         token = request.cookies.get(SESSION_COOKIE)
         if token:
@@ -582,7 +679,7 @@ def build_router(get_conn: Callable[..., Any], get_settings: Callable[..., Setti
     @internal.post("/login/issue", dependencies=[Depends(bot_guard)])
     def internal_issue(body: IssueIn, conn: Conn = Depends(get_conn), s: Settings = Depends(get_settings),
                        t: float = Depends(now_ts)) -> dict[str, Any]:
-        res = issue(conn, body.tg_id, t, s.login_ttl_s, body.nonce)
+        res = issue(conn, body.tg_id, t, s.login_ttl_s, body.nonce, s.web_hmac_key)
         if res.status != "issued":
             return {"status": res.status}
         out: dict[str, Any] = {"status": "issued", "url": f"{s.public_url}/auth/magic/{res.token}",
@@ -598,11 +695,12 @@ def build_router(get_conn: Callable[..., Any], get_settings: Callable[..., Setti
             raise HTTPException(status_code=403)
         return {"revoked": revoke_all(conn, body.tg_id, t)}
 
+    router.include_router(auth_routes)
     router.include_router(internal)
     return router
 ```
 
-Короткий ключ отвергает `main.py` (правка 3 ниже). Адреса `/internal/...` отвечают 404 и при неверном ключе, и при обращении не с локального адреса, чтобы снаружи было не видно, что они существуют.
+Короткий ключ (или отсутствующий `WEB_LOGIN_HMAC_KEY`) отвергает `main.py` (правка 3 ниже): приложение не стартует. Адреса `/internal/...` отвечают 404 и при неверном ключе, и при обращении не с локального адреса, чтобы снаружи было не видно, что они существуют.
 
 ### 6.3. Подключение в `main.py`
 
@@ -621,7 +719,7 @@ from app import auth, weblogin
 
 #### `app/main.py` (правка 2: кто сейчас пользователь)
 
-`current_user` принимает токен в заголовке (мини-приложение) **или**, если заголовка нет, куки сессии (обычный браузер). Если заголовок есть, но неверный, куки не пробуются: ответ 401.
+`current_user` принимает токен в заголовке (мини-приложение) **или**, если заголовка нет, куки сессии (обычный браузер). Если заголовок есть, он обязан быть верным `Bearer`: любой другой (`Basic ...`, пустой `Bearer`, мусор) даёт 401, а куки не пробуются. Куки сессии принимаются только пока расширение включено: выключили – старые веб-сессии не действуют (401), а таблицы `web_sessions` на свежей базе может и не быть, поэтому к ней в этом случае даже не обращаются.
 
 Найти:
 ```python
@@ -630,11 +728,14 @@ from app import auth, weblogin
 ```
 Заменить на:
 ```python
-    bearer = auth.bearer(request.headers.get("authorization"))
-    if bearer is not None:  # the Mini App sends a signed token in the header
-        tg_id = auth.read_session(settings.session_secret, bearer, t)
-    else:  # an ordinary browser sends the session cookie of the web login
+    header = request.headers.get("authorization")
+    if header is not None:  # the Mini App sends a signed token; a header that is present is never ignored
+        bearer = auth.bearer(header)
+        tg_id = auth.read_session(settings.session_secret, bearer, t) if bearer is not None else None
+    elif settings.web_login_enabled:  # an ordinary browser sends the session cookie of the web login
         tg_id = weblogin.session_tg(conn, request.cookies.get(weblogin.SESSION_COOKIE), t)
+    else:  # the extension is off: a cookie is no way in (and web_sessions may not exist)
+        tg_id = None
     if tg_id is None:
 ```
 
@@ -649,8 +750,10 @@ from app import auth, weblogin
 ```python
         migrate(conn, settings.allowed_tg_ids)
         if settings.web_login_enabled:
-            if len(settings.internal_key) < 32:
-                raise RuntimeError("WEB_LOGIN_INTERNAL_KEY must be at least 32 characters")
+            for name, value in (("WEB_LOGIN_INTERNAL_KEY", settings.internal_key),
+                                ("WEB_LOGIN_HMAC_KEY", settings.web_hmac_key)):
+                if len(value.encode()) < 32:  # the message names the variable, never the value
+                    raise RuntimeError(f"{name} must be at least 32 bytes")
             weblogin.create_tables(conn)
     finally:
 ```
@@ -981,7 +1084,7 @@ def handle(token: str, update: dict[str, Any], allowed: frozenset[int], public_u
 
 Только после «да» владельца. Службы и порядок те же, что в `starter.md`, раздел 10. Добавляется три вещи.
 
-1. **Настройки.** Допишите переменные из раздела 4 в `/etc/dashboard/backend.env` и `/etc/dashboard/bot.env`. Ключ создайте один раз и положите одинаковым в оба файла, не печатая на экран.
+1. **Настройки.** Допишите переменные из раздела 4 в `/etc/dashboard/backend.env` и `/etc/dashboard/bot.env`. `WEB_LOGIN_INTERNAL_KEY` создайте один раз и положите одинаковым в оба файла, не печатая на экран. `WEB_LOGIN_HMAC_KEY` – другое значение и **только** в `backend.env` (права 640, как у остальных секретов). `PUBLIC_URL` должен совпадать с адресом, с которого владелец открывает страницу входа, (схема, домен и порт): иначе проверка Origin откажет и ему.
 2. **Caddy закрывает `/internal` снаружи.** Эти адреса нужны только боту на этом же сервере. Правка в `deploy/Caddyfile`: блок для `/ingest` становится общим.
 
 #### `deploy/Caddyfile` (правка)
@@ -998,7 +1101,7 @@ def handle(token: str, update: dict[str, Any], allowed: frozenset[int], public_u
 ```
 
    Это второй рубеж: сам backend тоже отвечает 404 всем, кроме локального бота с ключом (служба слушает `127.0.0.1`, а Caddy передаёт настоящий адрес клиента через `--proxy-headers`, как в службе из `starter.md`).
-3. **Перезапуск.** `sudo systemctl restart dashboard dashboard-bot`. Таблицы создаются при старте.
+3. **Перезапуск.** `sudo systemctl restart dashboard dashboard-bot`. Таблицы создаются при старте. Если до этого стоял вариант расширения без `WEB_LOGIN_HMAC_KEY`: текущие попытки входа (5 минут) перестанут подходить, начать вход заново можно сразу; сессии не затронуты.
 
 Проверка с другого компьютера:
 
@@ -1006,6 +1109,8 @@ def handle(token: str, update: dict[str, Any], allowed: frozenset[int], public_u
 curl -s -o /dev/null -w '%{http_code}\n' -X POST https://<домен>/internal/login/issue   # must be 404
 curl -s -o /dev/null -w '%{http_code}\n' https://<домен>/login                          # 200
 curl -s -o /dev/null -w '%{http_code}\n' https://<домен>/api/summary                    # 401 (no cookie)
+curl -s -o /dev/null -w '%{http_code}\n' -X POST https://<домен>/auth/start             # 403 (no Origin, no Referer)
+curl -s -o /dev/null -w '%{http_code}\n' -X POST -H 'Origin: https://evil.example' https://<домен>/auth/start   # 403
 ```
 
 Затем владелец открывает `https://<домен>/login` в обычном браузере, проходит вход ссылкой и кодом; чужой Telegram-аккаунт должен получить «Нет доступа.». После входа цифры открываются, «Выйти» закрывает сессию.
@@ -1014,7 +1119,7 @@ curl -s -o /dev/null -w '%{http_code}\n' https://<домен>/api/summary       
 
 Тест-файл целиком. Он берёт из каркаса `create_app`, `Settings`, `auth`, `bot.bot` и работает на SQLite всегда, а на PostgreSQL – когда задана `TEST_DATABASE_URL` и применён `postgres.md` (иначе строки Postgres помечены «skipped»). Бот в тестах подключён прямо к приложению, поэтому сквозная проверка идёт по настоящему коду обеих сторон.
 
-Что проверяется: старт, выдача и вход по ссылке; вход по коду в привязанном браузере; отказ в чужом браузере; повторное использование; срок жизни; сжигание после 5 неверных кодов; чужой Telegram-id; лимит попыток; выход; закрытые адреса; хеши в базе; отсутствие секретов в логах.
+Что проверяется: старт, выдача и вход по ссылке; вход по коду в привязанном браузере; отказ в чужом браузере; повторное использование; срок жизни; сжигание после 5 неверных кодов; чужой Telegram-id; лимит попыток; выход; закрытые адреса; хеши в базе (код – HMAC с ключом, перебор миллиона простых sha256 ничего не находит); отсутствие секретов в логах; чужой Origin и отсутствие Origin отвергаются и не создают сессию; подтверждение без верного токена подтверждения отвергается (нет поля, чужое поле, нет куки, поле от другой ссылки); при выключенном расширении куки сессии не работает (401, не 500, в том числе на свежей базе); любой неверный `Authorization` даёт 401 и не уступает место куки; короткий или отсутствующий ключ – приложение не запускается.
 
 Перед тем как верить тестам, сломайте что-нибудь на пробу (например, уберите условие `consumed_at IS NULL` в `consume_magic`): хотя бы один тест обязан упасть.
 
@@ -1025,12 +1130,14 @@ curl -s -o /dev/null -w '%{http_code}\n' https://<домен>/api/summary       
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import logging
 import os
 import re
 import uuid
 from collections.abc import Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -1049,6 +1156,8 @@ STRANGER = 42
 BOT_USERNAME = "your_dash_bot"
 PUBLIC = "https://dashboard.example.com"
 KEY = "k" * 40
+HMAC_KEY = "h" * 40  # the server key of the code hashes and of the confirm-form tokens (never in the database)
+EVIL = "https://evil.example"
 T0 = 1_790_730_000.0
 KEY_HEADERS = {"Authorization": f"Bearer {KEY}"}
 CHROME_MAC = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -1063,8 +1172,10 @@ class World:
     settings: Settings
     bot: TestClient
 
-    def browser(self, ip: str = "203.0.113.7") -> TestClient:
-        return TestClient(self.app, base_url=PUBLIC, client=(ip, 50000), headers={"User-Agent": CHROME_MAC})
+    def browser(self, ip: str = "203.0.113.7", origin: str | None = PUBLIC) -> TestClient:
+        """A browser: it sends the Origin of the page it is on (origin=None: a client that sends no Origin)."""
+        headers = {"User-Agent": CHROME_MAC, **({"Origin": origin} if origin else {})}
+        return TestClient(self.app, base_url=PUBLIC, client=(ip, 50000), headers=headers)
 
     def at(self, seconds_after_t0: float) -> None:
         self.app.state.clock = lambda: T0 + seconds_after_t0
@@ -1084,7 +1195,8 @@ def world(request: pytest.FixtureRequest, tmp_path: Path) -> Iterator[World]:
     """A fresh app on each backend. PostgreSQL runs only with TEST_DATABASE_URL (and the postgres.md variant)."""
     common: dict[str, Any] = {
         "bot_token": "123456:TEST-TOKEN-NOT-REAL", "session_secret": b"s" * 40, "allowed_tg_ids": frozenset({OWNER}),
-        "tz": ZoneInfo("UTC"), "web_bot_username": BOT_USERNAME, "public_url": PUBLIC, "internal_key": KEY}
+        "tz": ZoneInfo("UTC"), "web_bot_username": BOT_USERNAME, "public_url": PUBLIC, "internal_key": KEY,
+        "web_hmac_key": HMAC_KEY}
     if request.param == "sqlite":
         yield build(Settings(db_path=tmp_path / "w.db", **common))
         return
@@ -1130,6 +1242,20 @@ def wrong(code: str) -> str:
     return "000000" if code != "000000" else "111111"
 
 
+def confirm_form(browser: TestClient, path: str) -> str:
+    """Open the link (GET) like a browser does: returns the hidden token of the «Войти» form."""
+    page = browser.get(path)
+    assert page.status_code == 200 and 'method="post"' in page.text
+    found = re.search(r'name="csrf" value="([0-9a-f]{64})"', page.text)
+    assert found, page.text
+    return found.group(1)
+
+
+def confirm(browser: TestClient, path: str) -> Any:
+    """Open the link and press «Войти»: the POST carries the page's hidden token."""
+    return browser.post(path, data={"csrf": confirm_form(browser, path)}, follow_redirects=False)
+
+
 def test_start_gives_deep_link_and_bound_cookie(world: World) -> None:
     r = world.browser().post("/auth/start")
     body = r.json()
@@ -1149,15 +1275,17 @@ def test_magic_link_logs_in_once(world: World) -> None:
     assert browser.get("/api/summary").status_code == 401  # no session yet
     page = browser.get(path_of(issued))  # a link preview does this: it must not use the token up
     assert page.status_code == 200 and 'method="post"' in page.text
-    assert page.headers["referrer-policy"] == "no-referrer" and "no-store" in page.headers["cache-control"]
+    assert page.headers["referrer-policy"] == "same-origin" and "no-store" in page.headers["cache-control"]
+    assert "dash_csrf=" in cookies_of(page) and "httponly" in cookies_of(page) and "samesite=strict" in cookies_of(page)
     assert browser.get(path_of(issued)).status_code == 200
-    ok = browser.post(path_of(issued), follow_redirects=False)
+    ok = confirm(browser, path_of(issued))
     assert ok.status_code == 303 and ok.headers["location"] == "/"
     cookie = cookies_of(ok)
     for part in ("dash_session=", "httponly", "secure", "samesite=lax", "path=/", "max-age=604800"):
         assert part in cookie
     assert browser.get("/api/summary").status_code == 200  # the cookie opens the dashboard API
-    assert world.browser().post(path_of(issued), follow_redirects=False).status_code == 400  # one use only
+    assert "dash_csrf=" in cookies_of(ok)  # the confirm cookie is deleted after use
+    assert confirm(world.browser(), path_of(issued)).status_code == 400  # one use only
 
 
 def test_code_in_the_bound_browser_logs_in_once(world: World) -> None:
@@ -1185,13 +1313,13 @@ def test_code_is_refused_in_another_browser(world: World) -> None:
 def test_link_and_code_cannot_be_reused(world: World) -> None:
     browser = world.browser()
     issued = issue(world, start(browser))
-    assert browser.post(path_of(issued), follow_redirects=False).status_code == 303
+    assert confirm(browser, path_of(issued)).status_code == 303
     used = browser.post("/auth/code", json={"code": issued["code"]})  # same attempt, already used by the link
     assert used.status_code == 400 and used.json()["status"] == "used"
     browser2 = world.browser()
     issued2 = issue(world, start(browser2))
     assert browser2.post("/auth/code", json={"code": issued2["code"]}).status_code == 200
-    assert world.browser().post(path_of(issued2), follow_redirects=False).status_code == 400  # link after code
+    assert confirm(world.browser(), path_of(issued2)).status_code == 400  # link after code
 
 
 def test_deep_link_gives_a_code_only_once(world: World) -> None:
@@ -1212,7 +1340,7 @@ def test_expiry(world: World) -> None:
     assert browser.post("/auth/code", json={"code": wrong(issued["code"])}).json()["status"] == "wrong"
     world.at(541)
     assert browser.post("/auth/code", json={"code": issued["code"]}).json()["status"] == "expired"
-    assert browser.post(path_of(issued), follow_redirects=False).status_code == 400  # the link expired together with it
+    assert confirm(browser, path_of(issued)).status_code == 400  # the link expired together with it
     late = start(world.browser())
     world.at(541 + 301)
     assert issue(world, late) == {"status": "expired"}  # the bot is opened after the attempt's life
@@ -1244,7 +1372,7 @@ def test_five_wrong_codes_burn_the_attempt(world: World) -> None:
     assert [a["left"] for a in answers] == [4, 3, 2, 1] and {a["status"] for a in answers} == {"wrong"}
     assert browser.post("/auth/code", json={"code": wrong(issued["code"])}).json()["status"] == "burned"
     assert browser.post("/auth/code", json={"code": issued["code"]}).json()["status"] == "burned"  # the right code is too late
-    assert browser.post(path_of(issued), follow_redirects=False).status_code == 400  # and so is the link
+    assert confirm(browser, path_of(issued)).status_code == 400  # and so is the link
     assert browser.get("/api/summary").status_code == 401
 
 
@@ -1281,8 +1409,8 @@ def test_rate_limits(world: World) -> None:
     assert guesser.post("/auth/code", json={"code": "123456"}).status_code == 429
     bad = "/auth/magic/" + "a" * 43
     for _ in range(5):
-        assert guesser.post(bad, follow_redirects=False).status_code == 400
-    assert guesser.post(bad, follow_redirects=False).status_code == 429
+        assert confirm(guesser, bad).status_code == 400
+    assert confirm(guesser, bad).status_code == 429
     assert world.browser(ip="198.51.100.11").post("/auth/code", json={"code": "12ab34"}).status_code == 422
     assert world.browser(ip="198.51.100.11").post("/auth/code", json={"code": "١٢٣٤٥٦"}).status_code == 422  # not ASCII digits
 
@@ -1308,8 +1436,8 @@ def test_logout_and_logout_everywhere(world: World) -> None:
 def test_bot_login_gives_a_link_only_and_a_new_one_cancels_the_old(world: World) -> None:
     first, second = issue(world, None), issue(world, None)
     assert first["status"] == "issued" and "code" not in first and "request" not in first
-    assert world.browser().post(path_of(first), follow_redirects=False).status_code == 400  # replaced by the second
-    assert world.browser().post(path_of(second), follow_redirects=False).status_code == 303
+    assert confirm(world.browser(), path_of(first)).status_code == 400  # replaced by the second
+    assert confirm(world.browser(), path_of(second)).status_code == 303
     conn = world.db()
     assert conn.execute("SELECT COUNT(*) FROM login_attempts WHERE code_hash IS NOT NULL").fetchone()[0] == 0
     conn.close()
@@ -1352,8 +1480,12 @@ def test_secrets_are_stored_only_as_hashes(world: World) -> None:
     for secret in (nonce, binding, token, session, issued["code"]):
         assert secret and secret not in everything
     assert attempt["nonce_hash"] == auth.sha256_hex(nonce) and attempt["magic_hash"] == auth.sha256_hex(token)
-    assert attempt["code_hash"] == auth.sha256_hex(f"{auth.sha256_hex(nonce)}:{issued['code']}")  # tied to the attempt
+    keyed = hmac.new(HMAC_KEY.encode(), f"{auth.sha256_hex(nonce)}:{issued['code']}".encode(), hashlib.sha256)
+    assert attempt["code_hash"] == keyed.hexdigest()  # keyed with the server key and tied to the attempt
     assert stored == auth.sha256_hex(session)
+    # a stolen dump (nonce hash + code hash) does not give the code: no plain sha256 of the 10**6 codes matches
+    leaked = attempt["code_hash"]
+    assert not any(hashlib.sha256(f"{attempt['nonce_hash']}:{n:06d}".encode()).hexdigest() == leaked for n in range(10**6))
     assert len(nonce) == len(token) == len(session) == 43  # 256 bits, url-safe
 
 
@@ -1366,16 +1498,19 @@ def test_no_ids_tokens_or_codes_in_logs(world: World, caplog: pytest.LogCaptureF
     browser.post("/auth/code", json={"code": wrong(issued["code"])})
     world.bot.post("/internal/login/issue", json={"tg_id": OWNER, "nonce": None})  # a refused call is logged too
     browser.post("/auth/code", json={"code": issued["code"]})
-    for secret in (str(OWNER), nonce, binding, path_of(issued).rsplit("/", 1)[1], issued["code"], KEY):
+    for secret in (str(OWNER), nonce, binding, path_of(issued).rsplit("/", 1)[1], issued["code"], KEY, HMAC_KEY):
         assert secret and secret not in caplog.text
 
 
-def test_cookie_never_overrides_a_bad_bearer_header(world: World) -> None:
+@pytest.mark.parametrize("header", ["Bearer garbage", "Bearer", "Bearer ", "bearer   ", "Basic dXNlcjpwYXNz", "Token abc", "x", ""])
+def test_cookie_never_overrides_an_authorization_header(world: World, header: str) -> None:
+    """A header that is present must be a correct Bearer token; otherwise 401, the cookie is not tried."""
     browser = world.browser()
     issued = issue(world, start(browser))
     assert browser.post("/auth/code", json={"code": issued["code"]}).status_code == 200
-    assert browser.get("/api/summary", headers={"Authorization": "Bearer garbage"}).status_code == 401
-    assert browser.get("/api/sections").status_code == 200
+    assert browser.get("/api/summary", headers={"Authorization": header}).status_code == 401
+    assert browser.get("/api/sections", headers={"Authorization": header}).status_code == 401
+    assert browser.get("/api/sections").status_code == 200  # without the header the cookie speaks
 
 
 def test_login_page_is_served(world: World) -> None:
@@ -1390,11 +1525,98 @@ def test_disabled_without_settings(tmp_path: Path) -> None:
     assert not off.web_login_enabled
     client = TestClient(create_app(off))
     assert client.post("/auth/start").status_code == 404 and client.get("/login").status_code == 404
-    on = load_settings({**env, "PUBLIC_URL": PUBLIC + "/", "WEB_LOGIN_BOT_USERNAME": "@" + BOT_USERNAME,
-                        "WEB_LOGIN_INTERNAL_KEY": KEY})
+    full = {**env, "PUBLIC_URL": PUBLIC + "/", "WEB_LOGIN_BOT_USERNAME": "@" + BOT_USERNAME,
+            "WEB_LOGIN_INTERNAL_KEY": KEY, "WEB_LOGIN_HMAC_KEY": HMAC_KEY}
+    on = load_settings(full)
     assert on.web_login_enabled and on.public_url == PUBLIC and on.web_bot_username == BOT_USERNAME
-    with pytest.raises(RuntimeError):  # a short shared key is refused at start
-        create_app(load_settings({**env, "PUBLIC_URL": PUBLIC, "WEB_LOGIN_BOT_USERNAME": "b", "WEB_LOGIN_INTERNAL_KEY": "short"}))
+    assert on.web_hmac_key == HMAC_KEY
+    create_app(on)  # both secrets are long enough
+    for name in ("WEB_LOGIN_INTERNAL_KEY", "WEB_LOGIN_HMAC_KEY"):
+        for bad in ("short", "é" * 15):  # too short: 30 bytes is still short
+            with pytest.raises(RuntimeError, match=name):  # web login is configured, a key is weak: the app does not start
+                create_app(load_settings({**full, name: bad}))
+    with pytest.raises(RuntimeError, match="WEB_LOGIN_HMAC_KEY"):  # configured, but the code key is missing
+        create_app(load_settings({**full, "WEB_LOGIN_HMAC_KEY": ""}))
+    assert not load_settings({**full, "WEB_LOGIN_INTERNAL_KEY": ""}).web_login_enabled  # no shared key: stays off
+
+
+def test_session_cookie_is_ignored_when_the_extension_is_off(world: World, tmp_path: Path) -> None:
+    browser = world.browser()
+    issued = issue(world, start(browser))
+    assert browser.post("/auth/code", json={"code": issued["code"]}).status_code == 200
+    cookie = {"Cookie": f"dash_session={browser.cookies.get('dash_session')}"}
+    assert browser.get("/api/summary").status_code == 200  # on: the session works
+    off = replace(world.settings, web_bot_username="", public_url="", internal_key="", web_hmac_key="")
+    assert not off.web_login_enabled
+    app = create_app(off)  # the same database, the extension switched off: the old session is still stored there
+    app.state.clock = lambda: T0
+    client = TestClient(app, base_url=PUBLIC, raise_server_exceptions=False)
+    assert client.get("/api/summary", headers=cookie).status_code == 401
+    assert client.get("/api/sections", headers=cookie).status_code == 401
+    # a fresh database has no web_sessions table at all: a well-formed cookie is 401, never a 500
+    fresh = Settings(db_path=tmp_path / "fresh.db", bot_token="1:x", session_secret=b"s" * 40,
+                     allowed_tg_ids=frozenset({OWNER}), tz=ZoneInfo("UTC"))
+    app = create_app(fresh)
+    app.state.clock = lambda: T0
+    client = TestClient(app, base_url=PUBLIC, raise_server_exceptions=False)
+    assert client.get("/api/summary", headers={"Cookie": "dash_session=" + "a" * 43}).status_code == 401
+    assert client.post("/auth/logout").status_code == 404  # and the web-login addresses do not exist
+
+
+# ---------- CSRF: who may press the buttons ----------
+
+def test_cross_origin_posts_are_rejected_and_make_no_session(world: World) -> None:
+    attacker, victim = world.browser(), world.browser()
+    issued = issue(world, start(attacker))  # the attacker's own valid link and code
+    path = path_of(issued)
+    field = confirm_form(attacker, path)  # a page the attacker can fetch for himself
+    foreign = ({"Origin": EVIL}, {"Origin": "null"}, {"Origin": "http://dashboard.example.com"},
+               {"Origin": "https://dashboard.example.com.evil.example"}, {"Referer": EVIL + "/page"},
+               {"Origin": EVIL, "Referer": PUBLIC + "/login"}, {})  # a present Origin is never overridden by Referer
+    for extra in foreign:
+        quiet = world.browser(origin=None)  # no default Origin: only what this attempt sends
+        bodies = ((path, {"data": {"csrf": field}}), ("/auth/start", {}), ("/auth/code", {"json": {"code": "123456"}}),
+                  ("/auth/logout", {}))
+        for url, kw in bodies:
+            r = quiet.post(url, headers=extra, follow_redirects=False, **kw)
+            assert r.status_code == 403, (url, extra, r.status_code)
+            assert "dash_session" not in cookies_of(r) and "dash_login" not in cookies_of(r)
+        assert quiet.get("/api/summary").status_code == 401
+    # even the right token, posted from a foreign page by the victim's browser, logs nobody in
+    r = victim.post(path, data={"csrf": field}, headers={"Origin": EVIL}, follow_redirects=False)
+    assert r.status_code == 403 and victim.get("/api/summary").status_code == 401
+    conn = world.db()
+    assert conn.execute("SELECT COUNT(*) FROM web_sessions").fetchone()[0] == 0
+    assert conn.execute("SELECT COUNT(*) FROM login_attempts WHERE consumed_at IS NOT NULL").fetchone()[0] == 0
+    conn.close()
+    assert attacker.post(path, data={"csrf": field}, follow_redirects=False).status_code == 303  # the link was not spent
+    # Referer is the fallback for a client without Origin; the same address passes
+    assert world.browser(origin=None).post("/auth/start", headers={"Referer": PUBLIC + "/login"}).status_code == 200
+
+
+def test_confirm_needs_the_csrf_token_of_this_browser(world: World) -> None:
+    issued = issue(world, start(world.browser()))
+    path = path_of(issued)
+    browser, other = world.browser(), world.browser()
+    field, other_field = confirm_form(browser, path), confirm_form(other, path)
+    assert field != other_field  # every opened page has its own token
+
+    def refused(r: Any) -> None:
+        assert r.status_code == 403 and "dash_session" not in cookies_of(r), r.status_code
+
+    refused(browser.post(path, follow_redirects=False))  # no field
+    refused(browser.post(path, data={"csrf": ""}, follow_redirects=False))
+    refused(browser.post(path, data={"csrf": "0" * 64}, follow_redirects=False))  # wrong field
+    refused(browser.post(path, data={"csrf": other_field}, follow_redirects=False))  # a field of another browser
+    refused(browser.post(path, data={"csrf": field.upper()}, follow_redirects=False))
+    refused(world.browser().post(path, data={"csrf": field}, follow_redirects=False))  # same Origin, but no cookie
+    other.cookies.clear()
+    refused(other.post(path, data={"csrf": other_field}, follow_redirects=False))  # cookie missing in its own browser
+    assert browser.get("/api/summary").status_code == 401
+    other_link = path.rsplit("/", 1)[0] + "/" + "b" * 43
+    refused(browser.post(other_link, data={"csrf": field}, follow_redirects=False))  # the token is tied to its link
+    ok = browser.post(path, data={"csrf": field}, follow_redirects=False)  # the refusals did not spend the link
+    assert ok.status_code == 303 and browser.get("/api/summary").status_code == 200
 
 
 # ---------- the bot, wired straight to the app ----------
@@ -1468,7 +1690,10 @@ def test_bot_without_web_login_behaves_as_before(sent: list[tuple[str, dict[str,
 ## 10. Чек-лист безопасности
 
 - [ ] Токены (метка, привязка, ссылка, сессия) – 256 случайных бит, в базе только sha256.
-- [ ] Код хранится хешем от «хеш метки:код», сравнение постоянного времени.
+- [ ] Код хранится как HMAC от «хеш метки:код» с ключом сервера (`WEB_LOGIN_HMAC_KEY`, 32+ байт, не в базе, только в `backend.env`); сравнение постоянного времени.
+- [ ] Любой POST под `/auth/...` проверяет Origin (или Referer); нет обоих, `null` и чужой адрес – 403.
+- [ ] Подтверждение ссылки требует токен подтверждения (куки `dash_csrf` + скрытое поле, HMAC над куки и ссылкой).
+- [ ] Куки сессии принимается только при включённом расширении; `Authorization` либо верный `Bearer`, либо 401.
 - [ ] Ссылка и код одноразовые; ссылка открывается подтверждением (GET ничего не тратит).
 - [ ] Срок жизни попытки и кода короткий (5 минут), сессии – 7 дней; настройки `login_ttl_s`, `web_session_ttl_s`.
 - [ ] Код работает только в браузере с куки-привязкой; 5 неверных кодов сжигают попытку вместе со ссылкой.
@@ -1487,6 +1712,11 @@ def test_bot_without_web_login_behaves_as_before(sent: list[tuple[str, dict[str,
 - **Код действует в любом браузере.** Тогда тому, кто увидел код (или переслал чужую ссылку входа), хватит одного кода. Код проверяется только вместе с куки-привязкой.
 - **Счётчик неверных кодов в два шага** (прочитать, потом записать): два одновременных подбора теряют счёт. Счёт и сжигание – один `UPDATE`.
 - **`\d` в проверке кода.** В регулярных выражениях Pydantic он принимает и нецифры других алфавитов. Пишите `[0-9]`.
+- **Подтверждение без проверки Origin и токена (login CSRF).** Чужая страница отправляет форму с действующей ссылкой злоумышленника из вашего браузера, и вы входите под чужим id. `SameSite=Lax` тут не помогает: он не запрещает принять куки. Нужны обе проверки: Origin на каждом POST и токен подтверждения.
+- **`Referrer-Policy: no-referrer` на странице подтверждения.** Браузер тогда шлёт с формой `Origin: null`, и проверка Origin отказывает самому владельцу (проверено в Chromium). Для страницы с кнопкой стоит `same-origin`: на чужие сайты по-прежнему ничего не уходит. Запросы `fetch` со страниц входа этим не затронуты.
+- **Куки сессии принимается при выключенном расширении.** Старые сессии остаются живыми, а на свежей базе нет таблицы `web_sessions`, и запрос с обычным куки даёт 500. Куки читается, только когда `web_login_enabled`. При повторном включении сессии, которые не истекли, снова заработают: перед выключением выполните `/logout_all`, если это важно.
+- **Неверный `Authorization` уступает куки.** Тогда заголовок `Basic ...` или пустой `Bearer` превращается в вход по куки, вопреки тексту. Присутствующий заголовок проверяется один раз и никогда не заменяется куки.
+- **Код хешируется без ключа.** Кодов миллион, и копия базы раскрывает код за секунды. Хеш делается HMAC с ключом, которого в базе нет.
 - **Закрытые адреса не закрыты.** Caddy по умолчанию передаёт наружу всё. Добавьте `/internal` в список 404 и проверьте `curl`-ом с другого компьютера.
 - **Секреты в логах.** Id, токен ссылки и код легко попадают в сообщение об ошибке или журнал доступа. В службе из `starter.md` журнал доступа отключён (`--no-access-log`): не включайте его обратно, адрес ссылки содержит токен.
 - **Куки без `Secure` или `HttpOnly`.** Первую читает любой перехватчик по обычному HTTP, вторую – любой скрипт на странице.
@@ -1506,12 +1736,14 @@ def test_bot_without_web_login_behaves_as_before(sent: list[tuple[str, dict[str,
 
 - SQLite: тесты каркаса и тесты входа;
 - PostgreSQL 17 (временный кластер, вариант каркаса из `postgres.md`): те же тесты, ни один не пропущен;
-- настоящий браузер (Chromium через Playwright, адрес `http://127.0.0.1`, Secure-куки там сохраняются): вход кодом, вход ссылкой, неверный код, повторная ссылка, выход, переход на `/login` без куки; экраны шириной 390 и 1366 пикселей без горизонтальной прокрутки;
-- ломать код на пробу: подмена условий (ссылка без «использовано», сжигание отключено, проверка локального адреса убрана, проверка allowlist убрана и другие) роняет хотя бы один тест.
+- настоящий браузер (Chromium через Playwright, адрес `http://127.0.0.1`, Secure-куки там сохраняются): вход кодом, вход ссылкой с настоящей отправкой формы, выход; форма с другого источника (другой порт) на ту же ссылку получает 403 и сессию не создаёт; со страницей подтверждения `Referrer-Policy: no-referrer` форма владельца тоже отвергается (`Origin: null`), с `same-origin` проходит;
+- ломать код на пробу: подмена условий (ссылка без «использовано», сжигание отключено, проверка локального адреса убрана, проверка allowlist убрана, проверка Origin убрана, проверка токена подтверждения убрана, чтение куки при выключенном расширении, откат к куки при неверном `Authorization`, код снова обычным sha256 и другие) роняет хотя бы один тест.
 
 Не проверено:
 - настоящий бот в Telegram и настоящий домен: бот в тестах подключён к приложению напрямую, сеть Telegram не использовалась;
 - как Telegram открывает ссылку входа на разных устройствах (приложение, веб-версия, встроенный браузер);
 - изменённый `deploy/Caddyfile` не прогонялся через `caddy validate`;
 - несколько процессов backend: счётчики лимитов в памяти одного процесса;
-- вариант без вашего `PUBLIC_URL` за прокси без `--proxy-headers`: тогда все клиенты выглядят как один адрес, и лимиты общие.
+- вариант без вашего `PUBLIC_URL` за прокси без `--proxy-headers`: тогда все клиенты выглядят как один адрес, и лимиты общие;
+- другие браузеры: проверен только Chromium. Что Firefox и Safari шлют `Origin` на POST формы со страницей `Referrer-Policy: same-origin` (а при его отсутствии `Referer` того же адреса), следует из спецификации, но запуском не проверено;
+- настоящий домен с HTTPS: `PUBLIC_URL` и Origin сравнивались только в тестах и на `http://127.0.0.1`.
