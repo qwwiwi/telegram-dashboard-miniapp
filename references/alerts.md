@@ -624,10 +624,13 @@ def template_text(facts: dict) -> str:
     return "\n".join(lines)
 
 
+UNKNOWN_CALL_USD = 0.05  # charged against the budget when the answer carries no cost
+
+
 def spent_this_month(conn: sqlite3.Connection, today: date) -> float:
-    """Known model spend of the month in USD (calls with an unknown cost add nothing)."""
-    row = conn.execute("SELECT COALESCE(SUM(cost_usd), 0) AS s FROM alert_spend WHERE substr(day, 1, 7) = ?",
-                       (today.isoformat()[:7],)).fetchone()
+    """Model spend of the month in USD; a call with an unknown cost counts as UNKNOWN_CALL_USD, never as zero."""
+    row = conn.execute("SELECT COALESCE(SUM(COALESCE(cost_usd, ?)), 0) AS s FROM alert_spend WHERE substr(day, 1, 7) = ?",
+                       (UNKNOWN_CALL_USD, today.isoformat()[:7])).fetchone()
     return float(row["s"])
 
 
